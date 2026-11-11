@@ -75,5 +75,32 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+### 动作接口协议（采集引擎 / 定时调度）
+
+- 动作放在请求体顶层 `action`，幂等令牌放在顶层 `token`；同时兼容旧协议
+  `values.action`。两处都传且取值不一致时返回 `ok=false` 并说明「动作冲突」，
+  不会任选一个执行。
+- 判定成败以响应体的 `ok` 为准，不能只看 HTTP 状态：业务拒绝也是 HTTP 200、
+  `ok=false`，`message` 里是后端给出的可读原因，前端需原样展示且不本地改行数据。
+- 带 `token` 的请求按「模块 + 记录 + 令牌」幂等：同一令牌的重复或并发提交只执行
+  一次，后续请求回传同一份最终结果（`duplicate=true`）；同令牌换动作返回 409。
+- 状态机由后端统一校验。采集引擎：暂停仅允许 `运行中→已停用`、恢复仅允许
+  `已停用→运行中`，`已完成` 为终态、不得恢复；定时调度：草稿必须先 `提交校验`
+  才能 `启用计划`，禁止跳级。
+
+### 测试
+
+```bash
+# 后端单元 + 接口回归（TestClient，含旧协议、冲突、重复/并发、非法动作、终态保护）
+python3 -m pytest backend/tests -m "not e2e"
+
+# 真实浏览器端到端（Playwright 驱动 Chromium，起真实 uvicorn + vite）
+ENABLE_BROWSER_E2E=1 BROWSER_LIB_ROOT=<浏览器本地依赖前缀> \
+  python3 -m pytest backend/tests -m e2e
+```
+
+端到端用例通过 `POST /api/testing/reset` 重置内存数据，该钩子仅在后端设置
+环境变量 `ENABLE_TEST_RESET=1` 时可用，默认关闭。
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA

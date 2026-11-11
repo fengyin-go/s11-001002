@@ -31,33 +31,36 @@
       <thead>
         <tr>
           <th v-for="column in columns" :key="column">{{ column }}</th>
+          <th>当前状态</th>
           <th>可执行动作</th>
         </tr>
       </thead>
       <tbody>
         <tr v-for="row in rows" :key="String(row.id)">
           <td v-for="column in columns" :key="column">{{ row[column] ?? '—' }}</td>
+          <td>{{ row.status ?? '—' }}</td>
           <td class="row-actions">
             <button
               v-for="action in actions"
               :key="action"
               class="link"
               type="button"
+              :disabled="isPending(row.id, action)"
               @click="runAction(action, row)"
             >
-              {{ action }}
+              {{ isPending(row.id, action) ? '执行中…' : action }}
             </button>
           </td>
         </tr>
         <tr v-if="!rows.length">
-          <td :colspan="columns.length + 1" class="empty-state">暂无采集引擎数据，可先登记采集任务</td>
+          <td :colspan="columns.length + 2" class="empty-state">暂无采集引擎数据，可先登记采集任务</td>
         </tr>
       </tbody>
     </table>
 
     <footer class="page-foot">
       <span>共 {{ total }} 条采集引擎记录</span>
-      <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
+      <span v-if="notice" :class="noticeKind === 'error' ? 'error-text' : 'success-text'">{{ notice }}</span>
     </footer>
   </section>
 </template>
@@ -65,21 +68,31 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue'
 
-import { request } from '@/api/client'
+import { createActionToken, postAction, request, type ActionResult } from '@/api/client'
 
 type Row = Record<string, string | number | null>
 
 const ENDPOINT = '/api/collector'
 const columns = ["任务编号", "目标网址", "HTTP方法", "请求头部", "并发线程", "超时秒数", "代理地址", "字符编码"]
 const actions = ["提交启动", "暂停采集", "恢复采集", "归档任务"]
-const statuses = ["草稿", "待启动", "运行中", "已完成", "已停用"]
 const stats = [{"label": "采集任务总数", "value": 0}, {"label": "运行中任务", "value": 0}, {"label": "已完成任务", "value": 0}]
 
 const rows = ref<Row[]>([])
 const total = ref(0)
-const errorMessage = ref('')
+const notice = ref('')
+const noticeKind = ref<'error' | 'success'>('error')
 const filters = ref<Record<string, string>>({})
 const filterFields = columns.slice(0, 3)
+// 正在执行的「记录-动作」键 -> 操作令牌；每次增删都整体替换对象，保证 Vue 可靠刷新禁用态。
+const pending = ref<Record<string, string>>({})
+
+function pendingKey(id: Row[keyof Row], action: string): string {
+  return `${String(id)}::${action}`
+}
+
+function isPending(id: Row[keyof Row], action: string): boolean {
+  return pendingKey(id, action) in pending.value
+}
 
 function resetFilters() {
   filters.value = {}
@@ -91,27 +104,37 @@ function exportRows() {
 }
 
 function openCreate() {
-  errorMessage.value = '采集任务登记入口尚未接入审批流'
+  noticeKind.value = 'error'
+  notice.value = '采集任务登记入口尚未接入审批流'
 }
 
 async function runAction(action: string, row: Row) {
-  errorMessage.value = ''
+  const key = pendingKey(row.id, action)
+  // 同一按钮重复点击：复用同一操作令牌，由后端保证只执行一次；不同按钮互不影响。
+  const token = pending.value[key] ?? createActionToken()
+  pending.value = { ...pending.value, [key]: token }
+  notice.value = ''
   try {
-    const response = await request(`${ENDPOINT}/${row.id}/actions`, {
-      method: 'POST',
-      body: JSON.stringify({ action }),
-    })
-    if (!response.ok) {
-      throw new Error('采集引擎动作未生效，请稍后重试')
-    }
+    const result: ActionResult = await postAction(
+      `${ENDPOINT}/${row.id}/actions`,
+      { action, token },
+      '采集引擎动作未生效',
+    )
+    noticeKind.value = 'success'
+    notice.value = result.duplicate ? `${result.message}（重复请求已确认，未重复执行）` : result.message
+    // 以后端返回的最终记录为准刷新列表，不用前端本地改数据掩盖服务端结果。
     await reload()
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '采集引擎操作失败'
+    // 业务拒绝（HTTP 200 但 ok=false，或 4xx）：展示后端原因，绝不假装完成、不本地改行状态。
+    noticeKind.value = 'error'
+    notice.value = error instanceof Error ? error.message : '采集引擎操作失败'
+  } finally {
+    const { [key]: _removed, ...rest } = pending.value
+    pending.value = rest
   }
 }
 
 async function reload() {
-  errorMessage.value = ''
   const query = new URLSearchParams(filters.value as Record<string, string>).toString()
   try {
     const response = await request(`${ENDPOINT}?${query}`)
@@ -122,7 +145,8 @@ async function reload() {
     rows.value = payload.items ?? []
     total.value = payload.total ?? rows.value.length
   } catch (error) {
-    errorMessage.value = error instanceof Error ? error.message : '采集引擎列表读取失败'
+    noticeKind.value = 'error'
+    notice.value = error instanceof Error ? error.message : '采集引擎列表读取失败'
   }
 }
 

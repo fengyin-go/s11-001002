@@ -5,8 +5,9 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
+from app.actions import ActionOutcome, idempotency, resolve_action
 from app.schemas import ActionResult, EntryPayload, PageResult
-from app.services.scheduler import SchedulerService
+from app.services.scheduler import MODULE, SchedulerService
 
 router = APIRouter(prefix="/api/scheduler", tags=["定时调度"])
 
@@ -50,12 +51,34 @@ def create_entry(payload: EntryPayload) -> ActionResult:
 
 @router.post("/{entry_id}/actions", response_model=ActionResult)
 def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
-    """对单条调度计划执行提交校验、启用计划、停用计划；不允许的动作会被拦下并说明原因。"""
-    action = str(payload.values.get("action") or "").strip()
-    entry, message = service.run_action(entry_id, action)
-    if entry is None:
-        return ActionResult(ok=False, message=message)
-    return ActionResult(ok=True, message=message, entry=entry)
+    """对单条调度计划执行动作。
+
+    同时兼容顶层 ``action``（新协议）与 ``values.action``（旧协议）；两处动作
+    冲突、动作缺失或状态机拒绝（含草稿未校验直接启用的跳级请求）都返回可读原因，
+    由前端按 ``ok`` 字段判断成败。带 ``token`` 的重复/并发提交只执行一次。
+    """
+    action, error = resolve_action(payload)
+    if error is not None:
+        return ActionResult(ok=False, message=error, token=(payload.token or None))
+
+    def execute() -> ActionOutcome:
+        entry, message = service.run_action(entry_id, action)
+        return entry is not None, entry, message
+
+    token = (payload.token or "").strip()
+    if not token:
+        entry, message = service.run_action(entry_id, action)
+        return ActionResult(ok=entry is not None, message=message, entry=entry)
+
+    result, _duplicate, conflict = idempotency.execute(
+        module=MODULE, entry_id=entry_id, token=token, action=action, func=execute
+    )
+    if conflict:
+        raise HTTPException(
+            status_code=409,
+            detail="同一操作令牌已用于其他动作，拒绝复用令牌；请使用新的操作令牌重新提交",
+        )
+    return ActionResult(**result)
 
 
 @router.get("/export")

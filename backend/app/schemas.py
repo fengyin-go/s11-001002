@@ -19,13 +19,24 @@ class ActionResult(BaseModel):
     ok: bool
     message: str
     entry: dict[str, Any] | None = None
+    # 幂等令牌回显与重复标记：重复请求拿到同样的最终结果，界面据此确认状态而非再执行一次。
+    token: str | None = None
+    duplicate: bool = False
 
 
 class EntryPayload(BaseModel):
-    """登记或修改一条业务记录时提交的字段集合。"""
+    """登记或修改一条业务记录时提交的字段集合。
+
+    动作接口同时兼容两种历史协议：
+    - 新协议：动作放在顶层 ``action``，幂等令牌放在顶层 ``token``；
+    - 旧协议：动作嵌在 ``values.action`` 里。
+    两处都给动作且取值不一致时按冲突拒绝，由路由层统一判定。
+    """
 
     values: dict[str, Any] = Field(default_factory=dict)
     remark: str | None = None
+    action: str | None = None
+    token: str | None = None
 
 
 

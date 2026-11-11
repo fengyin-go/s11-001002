@@ -5,21 +5,22 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
+from app.actions import ActionOutcome, idempotency, resolve_action
 from app.schemas import ActionResult, EntryPayload, PageResult
-from app.services.collector import CollectorService
+from app.services.collector import MODULE, CollectorService
 
 router = APIRouter(prefix="/api/collector", tags=["采集引擎"])
 
 service = CollectorService()
 
 LIST_FIELDS = ["任务编号", "目标网址", "HTTP方法", "请求头部", "并发线程", "超时秒数", "代理地址", "字符编码"]
-STATUSES = ["草稿", "待启动", "运行中", "已完成", "已停用"]
+STATUSES = ["草稿", "待启动", "运行中", "已停用", "已完成"]
 
 
 @router.get("", response_model=PageResult[dict])
 def list_entries(
     keyword: str | None = Query(default=None, description="按任务编号检索"),
-    status: str | None = Query(default=None, description="草稿、待启动、运行中、已完成、已停用"),
+    status: str | None = Query(default=None, description="草稿、待启动、运行中、已停用、已完成"),
     page: int = 1,
     size: int = 20,
 ) -> PageResult[dict]:
@@ -50,12 +51,35 @@ def create_entry(payload: EntryPayload) -> ActionResult:
 
 @router.post("/{entry_id}/actions", response_model=ActionResult)
 def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
-    """对单条采集任务执行提交启动、暂停采集、恢复采集、归档任务；不允许的动作会被拦下并说明原因。"""
-    action = str(payload.values.get("action") or "").strip()
-    entry, message = service.run_action(entry_id, action)
-    if entry is None:
-        return ActionResult(ok=False, message=message)
-    return ActionResult(ok=True, message=message, entry=entry)
+    """对单条采集任务执行动作。
+
+    同时兼容顶层 ``action``（新协议）与 ``values.action``（旧协议）；两处动作
+    冲突、动作缺失或状态机拒绝都返回可读原因，由前端按 ``ok`` 字段判断成败。
+    带 ``token`` 的重复/并发提交只执行一次，并回传同一份最终结果。
+    """
+    action, error = resolve_action(payload)
+    if error is not None:
+        return ActionResult(ok=False, message=error, token=(payload.token or None))
+
+    def execute() -> ActionOutcome:
+        entry, message = service.run_action(entry_id, action)
+        return entry is not None, entry, message
+
+    token = (payload.token or "").strip()
+    if not token:
+        # 兼容不带幂等令牌的旧调用方：直接执行，不做去重。
+        entry, message = execute()
+        return ActionResult(ok=entry is not None, message=message, entry=entry)
+
+    result, _duplicate, conflict = idempotency.execute(
+        module=MODULE, entry_id=entry_id, token=token, action=action, func=execute
+    )
+    if conflict:
+        raise HTTPException(
+            status_code=409,
+            detail="同一操作令牌已用于其他动作，拒绝复用令牌；请使用新的操作令牌重新提交",
+        )
+    return ActionResult(**result)
 
 
 @router.get("/export")
